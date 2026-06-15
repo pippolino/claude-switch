@@ -1,0 +1,9 @@
+.DS_Store
+*.swp
+
+# Editors / IDEs
+.idea/
+.vscode/
+
+# Local Claude Code project settings (machine-specific)
+.claude/settings.local.json

@@ -1,0 +1,404 @@
+#!/usr/bin/env bash
+#
+# claude-switch — switch between Claude Code configuration profiles.
+#
+# A "profile" is, at minimum, a saved ~/.claude/settings.json (the `env` block
+# that selects subscription vs Bedrock/AWS/Kimi/etc.). Optionally a profile can
+# also carry the macOS Keychain OAuth credential + the `oauthAccount` slice of
+# ~/.claude.json, so you can switch between two distinct Anthropic subscriptions.
+#
+# It NEVER touches the rest of ~/.claude/ (history, plugins, agents, sessions):
+# that stays shared across all profiles.
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+CLAUDE_HOME="${CLAUDE_HOME:-$HOME/.claude}"
+CLAUDE_JSON="${CLAUDE_JSON:-$HOME/.claude.json}"
+SETTINGS="$CLAUDE_HOME/settings.json"
+PROFILES_DIR="${CLAUDE_PROFILES_DIR:-$HOME/.claude-profiles}"
+BACKUPS_DIR="$PROFILES_DIR/.backups"
+ACTIVE_FILE="$PROFILES_DIR/.active"
+
+KC_SERVICE="${KC_SERVICE:-Claude Code-credentials}"   # macOS Keychain service name
+
+PY="$(command -v python3 || true)"
+
+# ---------------------------------------------------------------------------
+# Pretty output
+# ---------------------------------------------------------------------------
+if [ -t 1 ]; then
+  B=$'\033[1m'; DIM=$'\033[2m'; R=$'\033[0m'
+  GRN=$'\033[32m'; YEL=$'\033[33m'; BLU=$'\033[34m'; RED=$'\033[31m'; CYA=$'\033[36m'
+else
+  B=''; DIM=''; R=''; GRN=''; YEL=''; BLU=''; RED=''; CYA=''
+fi
+
+info() { printf '%s\n' "$*"; }
+ok()   { printf '%s✓%s %s\n' "$GRN" "$R" "$*"; }
+warn() { printf '%s!%s %s\n' "$YEL" "$R" "$*" >&2; }
+err()  { printf '%s✗%s %s\n' "$RED" "$R" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+confirm() {
+  local prompt="${1:-Continue?}"
+  printf '%s [y/N] ' "$prompt" >&2
+  read -r ans
+  [[ "$ans" =~ ^[yY]([eE][sS])?$ ]]
+}
+
+[ -n "$PY" ] || die "python3 not found (required for safe JSON handling)."
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+ensure_dirs() { mkdir -p "$PROFILES_DIR" "$BACKUPS_DIR"; }
+
+profile_dir() { printf '%s/%s' "$PROFILES_DIR" "$1"; }
+
+profile_exists() { [ -d "$(profile_dir "$1")" ]; }
+
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
+
+active_name() { [ -f "$ACTIVE_FILE" ] && cat "$ACTIVE_FILE" || true; }
+
+timestamp() { date +%Y%m%d-%H%M%S; }
+
+# Summarize a settings.json: provider + model. Reads $1 (path).
+summarize_settings() {
+  local f="$1"
+  [ -f "$f" ] || { printf '%s' "(no settings.json)"; return; }
+  "$PY" - "$f" <<'EOF'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception as e:
+    print("(unreadable settings.json: %s)" % e); raise SystemExit
+env = d.get("env", {}) or {}
+def has(k): return k in env and str(env[k]) not in ("", "0", "false", "False")
+if has("CLAUDE_CODE_USE_BEDROCK"):
+    prov = "bedrock"
+elif has("CLAUDE_CODE_USE_ANTHROPIC_AWS") or has("ANTHROPIC_AWS_WORKSPACE_ID"):
+    prov = "aws"
+elif has("CLAUDE_CODE_USE_VERTEX"):
+    prov = "vertex"
+elif env.get("ANTHROPIC_BASE_URL"):
+    prov = "custom (%s)" % env["ANTHROPIC_BASE_URL"]
+else:
+    prov = "anthropic (subscription)"
+model = d.get("model") or env.get("ANTHROPIC_MODEL") or "default"
+print("%-28s model=%s" % (prov, model))
+EOF
+}
+
+# Read the current Keychain credential value (raw). Empty on failure.
+kc_read() {
+  security find-generic-password -s "$KC_SERVICE" -w 2>/dev/null || true
+}
+
+# Detect the Keychain account name (acct) for the Claude credential.
+kc_account() {
+  security find-generic-password -s "$KC_SERVICE" 2>/dev/null \
+    | sed -n 's/.*"acct"<blob>="\(.*\)"/\1/p' | head -1
+}
+
+# Write a credential value into the Keychain (updates in place).
+kc_write() {
+  local value="$1" acct="$2"
+  [ -n "$acct" ] || acct="$USER"
+  security add-generic-password -U -s "$KC_SERVICE" -a "$acct" -w "$value" 2>/dev/null
+}
+
+is_macos() { [ "$(uname -s)" = "Darwin" ]; }
+
+# Extract the oauthAccount slice of ~/.claude.json into $1 (out path).
+dump_oauth_account() {
+  local out="$1"
+  "$PY" - "$CLAUDE_JSON" "$out" <<'EOF'
+import json, sys
+src, out = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(src))
+except Exception:
+    raise SystemExit(0)
+oa = d.get("oauthAccount")
+if oa is None:
+    raise SystemExit(0)
+json.dump(oa, open(out, "w"), indent=2)
+EOF
+}
+
+# Merge an oauthAccount slice ($1) back into ~/.claude.json.
+merge_oauth_account() {
+  local slice="$1"
+  "$PY" - "$CLAUDE_JSON" "$slice" <<'EOF'
+import json, sys
+target, slice_path = sys.argv[1], sys.argv[2]
+d = json.load(open(target))
+d["oauthAccount"] = json.load(open(slice_path))
+json.dump(d, open(target, "w"), indent=2)
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+cmd_list() {
+  ensure_dirs
+  local active; active="$(active_name)"
+  local found=0
+  printf '%sProfiles in %s%s\n\n' "$B" "$PROFILES_DIR" "$R"
+  local d name marker acct desc
+  for d in "$PROFILES_DIR"/*/; do
+    [ -d "$d" ] || continue
+    name="$(basename "$d")"
+    [ "$name" = ".backups" ] && continue
+    found=1
+    if [ "$name" = "$active" ]; then marker="${GRN}●${R}"; else marker=" "; fi
+    acct=""
+    [ -f "$d/credentials.json" ] && acct="${CYA}[+creds]${R}"
+    desc=""
+    [ -f "$d/desc" ] && desc="${DIM}$(cat "$d/desc")${R}"
+    printf '  %s %s%-16s%s %s %s\n' "$marker" "$B" "$name" "$R" \
+      "$(summarize_settings "$d/settings.json")" "$acct"
+    [ -n "$desc" ] && printf '       %s\n' "$desc"
+  done
+  [ "$found" = 1 ] || warn "No profiles yet. Create one with: claude-switch save <name>  or  claude-switch import"
+}
+
+cmd_current() {
+  local active; active="$(active_name)"
+  printf '%sActive:%s %s\n' "$B" "$R" "${active:-<unknown>}"
+  printf '%sLive  :%s %s\n' "$B" "$R" "$(summarize_settings "$SETTINGS")"
+  if is_macos; then
+    local acct; acct="$(kc_account)"
+    [ -n "$acct" ] && printf '%sKeychain creds:%s present (acct=%s)\n' "$B" "$R" "$acct"
+  fi
+}
+
+cmd_backup() {
+  ensure_dirs
+  local id dir; id="$(timestamp)"; dir="$BACKUPS_DIR/$id"
+  mkdir -p "$dir"
+  [ -f "$SETTINGS" ] && cp "$SETTINGS" "$dir/settings.json"
+  if is_macos; then
+    local v; v="$(kc_read)"
+    if [ -n "$v" ]; then printf '%s' "$v" > "$dir/credentials.json"; chmod 600 "$dir/credentials.json"; fi
+  fi
+  dump_oauth_account "$dir/oauthAccount.json" || true
+  ok "Backup created: $dir"
+}
+
+cmd_save() {
+  ensure_dirs
+  local name="" with_account=0 desc=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --account) with_account=1 ;;
+      --desc) shift; desc="${1:-}" ;;
+      -*) die "Unknown option: $1" ;;
+      *) name="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$name" ] || die "Usage: claude-switch save <name> [--account] [--desc \"...\"]"
+  valid_name "$name" || die "Invalid name (use A-Z a-z 0-9 . _ -)."
+
+  local dir; dir="$(profile_dir "$name")"
+  if profile_exists "$name"; then
+    confirm "Profile '$name' already exists. Overwrite?" || { warn "Aborted."; return; }
+  fi
+  mkdir -p "$dir"
+
+  [ -f "$SETTINGS" ] || die "No $SETTINGS to save."
+  cp "$SETTINGS" "$dir/settings.json"
+  [ -n "$desc" ] && printf '%s' "$desc" > "$dir/desc"
+
+  if [ "$with_account" = 1 ]; then
+    is_macos || die "--account is only supported on macOS (Keychain)."
+    local v; v="$(kc_read)"
+    [ -n "$v" ] || die "No credential found in Keychain ($KC_SERVICE)."
+    printf '%s' "$v" > "$dir/credentials.json"; chmod 600 "$dir/credentials.json"
+    dump_oauth_account "$dir/oauthAccount.json" || true
+    ok "Profile '$name' saved (settings + account credentials)."
+  else
+    ok "Profile '$name' saved (settings.json only)."
+  fi
+  printf '%s' "$name" > "$ACTIVE_FILE"
+}
+
+cmd_use() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "Usage: claude-switch use <name>"
+  profile_exists "$name" || die "Profile '$name' does not exist. See: claude-switch list"
+  local dir; dir="$(profile_dir "$name")"
+  [ -f "$dir/settings.json" ] || die "Profile '$name' has no settings.json."
+
+  # Auto-backup the current live state before overwriting.
+  cmd_backup >/dev/null
+  local last; last="$(ls -1 "$BACKUPS_DIR" | tail -1)"
+
+  mkdir -p "$CLAUDE_HOME"
+  cp "$dir/settings.json" "$SETTINGS"
+
+  local note=""
+  if [ -f "$dir/credentials.json" ]; then
+    if is_macos; then
+      local acct; acct="$(kc_account)"; [ -n "$acct" ] || acct="$USER"
+      if kc_write "$(cat "$dir/credentials.json")" "$acct"; then
+        note="$note +keychain"
+      else
+        warn "Could not write to Keychain (authorization may be required)."
+      fi
+      if [ -f "$dir/oauthAccount.json" ] && [ -f "$CLAUDE_JSON" ]; then
+        merge_oauth_account "$dir/oauthAccount.json" && note="$note +oauthAccount"
+      fi
+    else
+      warn "Profile has credentials but you are not on macOS: skipped."
+    fi
+  fi
+
+  printf '%s' "$name" > "$ACTIVE_FILE"
+  ok "Active profile: ${B}$name${R}${note:+ ($note )}"
+  info "  $(summarize_settings "$SETTINGS")"
+  info "  ${DIM}previous backup: $BACKUPS_DIR/$last${R}"
+  warn "Restart Claude Code (new session) for the env to take effect."
+}
+
+cmd_delete() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "Usage: claude-switch delete <name>"
+  profile_exists "$name" || die "Profile '$name' does not exist."
+  confirm "Delete profile '$name'?" || { warn "Aborted."; return; }
+  rm -rf "$(profile_dir "$name")"
+  [ "$(active_name)" = "$name" ] && rm -f "$ACTIVE_FILE"
+  ok "Profile '$name' deleted."
+}
+
+cmd_import() {
+  ensure_dirs
+  local found=0 f base name
+  # Import existing settings_*.json files from ~/.claude as profiles.
+  for f in "$CLAUDE_HOME"/settings_*.json; do
+    [ -f "$f" ] || continue
+    base="$(basename "$f")"          # settings_bedrock.json
+    name="${base#settings_}"; name="${name%.json}"   # bedrock
+    found=1
+    local dir; dir="$(profile_dir "$name")"
+    if profile_exists "$name"; then
+      warn "skipping '$name' (already exists)"
+      continue
+    fi
+    mkdir -p "$dir"
+    cp "$f" "$dir/settings.json"
+    ok "imported '$name'  ->  $(summarize_settings "$dir/settings.json")"
+  done
+  [ "$found" = 1 ] || warn "No settings_*.json found in $CLAUDE_HOME"
+  info ""
+  info "Tip: save your current settings.json as a profile with:"
+  info "  ${DIM}claude-switch save default --account --desc \"Anthropic subscription\"${R}"
+}
+
+cmd_edit() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "Usage: claude-switch edit <name>"
+  profile_exists "$name" || die "Profile '$name' does not exist."
+  "${EDITOR:-vi}" "$(profile_dir "$name")/settings.json"
+}
+
+cmd_diff() {
+  local a="${1:-}" b="${2:-}"
+  [ -n "$a" ] || die "Usage: claude-switch diff <nameA> [nameB|live]"
+  local fa fb
+  fa="$(profile_dir "$a")/settings.json"; profile_exists "$a" || die "Profile '$a' does not exist."
+  if [ -z "$b" ] || [ "$b" = "live" ]; then fb="$SETTINGS"; b="live"; else
+    profile_exists "$b" || die "Profile '$b' does not exist."; fb="$(profile_dir "$b")/settings.json"; fi
+  info "${B}$a${R}  vs  ${B}$b${R}"
+  diff -u "$fa" "$fb" || true
+}
+
+cmd_backups() {
+  ensure_dirs
+  local d
+  printf '%sBackups in %s%s\n' "$B" "$BACKUPS_DIR" "$R"
+  for d in "$BACKUPS_DIR"/*/; do
+    [ -d "$d" ] || continue
+    printf '  %s  %s\n' "$(basename "$d")" "$(summarize_settings "$d/settings.json")"
+  done
+}
+
+cmd_restore() {
+  local id="${1:-}"
+  [ -n "$id" ] || die "Usage: claude-switch restore <backup-id>  (see: claude-switch backups)"
+  local dir="$BACKUPS_DIR/$id"
+  [ -d "$dir" ] || die "Backup '$id' does not exist."
+  [ -f "$dir/settings.json" ] && cp "$dir/settings.json" "$SETTINGS"
+  if is_macos && [ -f "$dir/credentials.json" ]; then
+    kc_write "$(cat "$dir/credentials.json")" "$(kc_account)" || warn "Keychain not updated."
+  fi
+  [ -f "$dir/oauthAccount.json" ] && [ -f "$CLAUDE_JSON" ] && merge_oauth_account "$dir/oauthAccount.json" || true
+  rm -f "$ACTIVE_FILE"
+  ok "Restored backup $id. Restart Claude Code."
+}
+
+cmd_help() {
+  cat <<EOF
+${B}claude-switch${R} — switch Claude Code configuration profiles
+
+${B}USAGE${R}
+  claude-switch <command> [args]
+
+${B}COMMANDS${R}
+  ${GRN}list${R}, ls              List profiles (● = active)
+  ${GRN}current${R}, status       Show the active profile and live state
+  ${GRN}use${R} <name>            Switch to a profile (auto-backs up first)
+  ${GRN}save${R} <name>           Save the current settings.json as a profile
+        [--account]        ...including Keychain credentials + oauthAccount
+        [--desc "..."]     ...with a description
+  ${GRN}import${R}                Import existing settings_*.json files as profiles
+  ${GRN}diff${R} <a> [b|live]     Compare two profiles' settings
+  ${GRN}edit${R} <name>           Open a profile's settings.json in \$EDITOR
+  ${GRN}delete${R}, rm <name>     Delete a profile
+  ${GRN}backup${R}                Manually back up the live state
+  ${GRN}backups${R}               List backups
+  ${GRN}restore${R} <id>          Restore a backup
+  ${GRN}help${R}                  This help
+
+${B}WHAT GETS SWAPPED${R}
+  Always:     ~/.claude/settings.json   (env block: provider/model)
+  With --account (macOS only):
+              Keychain "Claude Code-credentials" (OAuth token)
+              oauthAccount field in ~/.claude.json
+  Never touched: the rest of ~/.claude/ (history, plugins, agents, sessions)
+
+${B}NOTE${R}
+  After a switch, restart Claude Code: the settings.json env block
+  is read at session startup.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+main() {
+  local cmd="${1:-list}"; shift || true
+  case "$cmd" in
+    list|ls)        cmd_list "$@" ;;
+    current|status) cmd_current "$@" ;;
+    use|switch)     cmd_use "$@" ;;
+    save)           cmd_save "$@" ;;
+    import)         cmd_import "$@" ;;
+    diff)           cmd_diff "$@" ;;
+    edit)           cmd_edit "$@" ;;
+    delete|rm)      cmd_delete "$@" ;;
+    backup)         cmd_backup "$@" ;;
+    backups)        cmd_backups "$@" ;;
+    restore)        cmd_restore "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *)              err "Unknown command: $cmd"; echo; cmd_help; exit 1 ;;
+  esac
+}
+
+main "$@"

@@ -32,12 +32,23 @@ mean losing your history and working setup.
 
 ## Install
 
+One line, no clone needed:
+
 ```bash
-./install.sh          # symlinks into ~/.local/bin (or /usr/local/bin)
-claude-switch help
+curl -fsSL https://raw.githubusercontent.com/pippolino/claude-switch/main/install.sh | bash
 ```
 
-Or run it in place without installing: `./bin/claude-switch help`.
+This downloads `claude-switch` into the first writable PATH dir it finds
+(`~/.local/bin`, `/usr/local/bin`, or `/opt/homebrew/bin`). Override with
+`PREFIX=/usr/local/bin`.
+
+From a clone (symlinks the binary, so your edits take effect immediately):
+
+```bash
+./install.sh
+```
+
+Or just run it in place: `./bin/claude-switch help`.
 
 ## Usage
 

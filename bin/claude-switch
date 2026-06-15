@@ -64,6 +64,16 @@ valid_name() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
 
 active_name() { [ -f "$ACTIVE_FILE" ] && cat "$ACTIVE_FILE" || true; }
 
+# True if the live settings.json differs from the active profile's snapshot.
+# Byte comparison is safe because `save` does a plain cp (no reformatting).
+has_unsaved_changes() {
+  local active; active="$(active_name)"
+  [ -n "$active" ] || return 1
+  local snap; snap="$(profile_dir "$active")/settings.json"
+  [ -f "$SETTINGS" ] && [ -f "$snap" ] || return 1
+  ! cmp -s "$SETTINGS" "$snap"
+}
+
 timestamp() { date +%Y%m%d-%H%M%S; }
 
 # Summarize a settings.json: provider + model. Reads $1 (path).
@@ -236,6 +246,16 @@ cmd_use() {
   local dir; dir="$(profile_dir "$name")"
   [ -f "$dir/settings.json" ] || die "Profile '$name' has no settings.json."
 
+  # Offer to persist unsaved live edits into the active profile before switching.
+  # Skipped when non-interactive (no tty); the auto-backup below is the safety net.
+  if [ -t 0 ] && has_unsaved_changes; then
+    local active; active="$(active_name)"
+    if confirm "Current config has unsaved changes vs profile '$active'. Save them into '$active' first?"; then
+      cp "$SETTINGS" "$(profile_dir "$active")/settings.json"
+      ok "Saved changes into '$active'."
+    fi
+  fi
+
   # Auto-backup the current live state before overwriting.
   cmd_backup >/dev/null
   local last; last="$(ls -1 "$BACKUPS_DIR" | tail -1)"
@@ -353,7 +373,8 @@ ${B}USAGE${R}
 ${B}COMMANDS${R}
   ${GRN}list${R}, ls              List profiles (● = active)
   ${GRN}current${R}, status       Show the active profile and live state
-  ${GRN}use${R} <name>            Switch to a profile (auto-backs up first)
+  ${GRN}use${R} <name>            Switch to a profile (prompts to save unsaved
+                         changes, then auto-backs up first)
   ${GRN}save${R} <name>           Save the current settings.json as a profile
         [--account]        ...including Keychain credentials + oauthAccount
         [--desc "..."]     ...with a description

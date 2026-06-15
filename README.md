@@ -57,7 +57,7 @@ claude-switch import                       # import your existing settings_*.jso
 claude-switch save default --account \      # save the current state as "default"
               --desc "Anthropic subscription"
 claude-switch list                         # list profiles (● = active)
-claude-switch use bedrock                  # switch to Bedrock (auto-backup first)
+claude-switch use bedrock                  # switch to Bedrock (offers to save unsaved changes, auto-backup first)
 claude-switch current                      # show the active profile
 claude-switch diff bedrock kimi            # compare two profiles
 claude-switch backups                      # list automatic backups
@@ -66,6 +66,10 @@ claude-switch restore 20260615-193026      # restore a backup
 
 > After every `use`, **restart Claude Code**: the `env` block of `settings.json` is read at
 > session startup.
+
+> If your live `settings.json` has changes that aren't saved into the active profile, `use`
+> prompts you to save them into that profile before switching. Decline (or run non-interactively)
+> and it just continues — the automatic backup still lets you `restore` the previous state.
 
 ## On-disk layout
 
